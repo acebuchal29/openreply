@@ -1,11 +1,42 @@
-import { getMetaGraphApiVersion, requireEnv } from "@/lib/env";
+import { getMetaGraphApiVersion, isUnifiedLogin, requireEnv } from "@/lib/env";
 
+// Unified-login tokens (system-user tokens) only work on graph.facebook.com;
+// the Instagram-node paths used below are the same on both hosts.
 function instagramGraphBase() {
-  return `https://graph.instagram.com/${getMetaGraphApiVersion()}`;
+  return isUnifiedLogin()
+    ? facebookGraphBase()
+    : `https://graph.instagram.com/${getMetaGraphApiVersion()}`;
 }
 
 function facebookGraphBase() {
   return `https://graph.facebook.com/${getMetaGraphApiVersion()}`;
+}
+
+// With a unified-login token `/me` is the system user, not the Instagram
+// account, so `/me/...` calls are rewritten to the assigned Instagram account.
+const assignedAccountCache = new Map<string, string>();
+
+export async function getAssignedInstagramAccountId(
+  accessToken: string
+): Promise<string> {
+  const cached = assignedAccountCache.get(accessToken);
+  if (cached) return cached;
+  const url = new URL(`${facebookGraphBase()}/me/assigned_instagram_accounts`);
+  url.searchParams.set("access_token", accessToken);
+  const response = await fetch(url.toString());
+  const data = await handleResponse<{ data?: Array<{ id: string }> }>(response);
+  const id = data.data?.[0]?.id;
+  if (!id) {
+    throw new PermissionError(
+      "No Instagram account is assigned to this connection. Reconnect and select your Instagram account."
+    );
+  }
+  assignedAccountCache.set(accessToken, id);
+  return id;
+}
+
+async function meNode(accessToken: string): Promise<string> {
+  return isUnifiedLogin() ? getAssignedInstagramAccountId(accessToken) : "me";
 }
 
 export class MetaApiError extends Error {
@@ -665,6 +696,21 @@ export async function getConversationMessages(
 }
 
 export async function getUserInfo(accessToken: string): Promise<InstagramUser> {
+  if (isUnifiedLogin()) {
+    // The Instagram User node on graph.facebook.com has no user_id field; its
+    // id already is the professional account id that webhooks use.
+    const igId = await getAssignedInstagramAccountId(accessToken);
+    const url = new URL(`${instagramGraphBase()}/${igId}`);
+    url.searchParams.set(
+      "fields",
+      "id,username,name,profile_picture_url,followers_count"
+    );
+    url.searchParams.set("access_token", accessToken);
+    const response = await fetch(url.toString());
+    const user = await handleResponse<InstagramUser>(response);
+    return { ...user, user_id: user.id };
+  }
+
   const url = new URL(`${instagramGraphBase()}/me`);
   url.searchParams.set(
     "fields",
@@ -686,7 +732,7 @@ export async function getUserMedia(
   accessToken: string,
   limit = 25
 ): Promise<InstagramMedia[]> {
-  const url = new URL(`${instagramGraphBase()}/me/media`);
+  const url = new URL(`${instagramGraphBase()}/${await meNode(accessToken)}/media`);
   url.searchParams.set("fields", MEDIA_FIELDS);
   url.searchParams.set("limit", limit.toString());
   url.searchParams.set("access_token", accessToken);
@@ -708,7 +754,7 @@ export async function getAllUserMedia(
 ): Promise<InstagramMedia[]> {
   const results: InstagramMedia[] = [];
 
-  const first = new URL(`${instagramGraphBase()}/me/media`);
+  const first = new URL(`${instagramGraphBase()}/${await meNode(accessToken)}/media`);
   first.searchParams.set("fields", MEDIA_FIELDS);
   first.searchParams.set("limit", String(Math.min(MEDIA_PAGE_SIZE, max)));
   first.searchParams.set("access_token", accessToken);
@@ -872,8 +918,12 @@ export async function subscribeInstagramAccountToWebhooks(
         "Content-Type": "application/json",
         Authorization: `Bearer ${accessToken}`,
       },
+      // Each call replaces the whole field list. On graph.facebook.com button
+      // taps arrive as a separate messaging_postbacks field.
       body: JSON.stringify({
-        subscribed_fields: ["comments", "messages"],
+        subscribed_fields: isUnifiedLogin()
+          ? "comments,messages,messaging_postbacks"
+          : ["comments", "messages"],
       }),
     }
   );

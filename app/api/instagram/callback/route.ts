@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
 import { prisma } from "@/lib/db/client";
-import { getBaseUrl } from "@/lib/env";
+import { getBaseUrl, isUnifiedLogin } from "@/lib/env";
 import { canConnectInstagramAccount } from "@/lib/instagram-accounts";
 import { getLongLivedToken, getUserInfo, subscribeInstagramAccountToWebhooks } from "@/lib/meta/client";
 import {
@@ -47,8 +47,13 @@ export async function GET(request: NextRequest) {
       code,
       redirectUri
     );
-    const { accessToken: longLivedToken, expiresIn } =
-      await getLongLivedToken(shortLivedToken);
+    // Unified login returns a system-user token that does not expire (the
+    // configuration says "Never"), so there is nothing to exchange or refresh.
+    // A null tokenExpiresAt keeps the refresh cron away from it.
+    const unified = isUnifiedLogin();
+    const { accessToken: longLivedToken, expiresIn } = unified
+      ? { accessToken: shortLivedToken, expiresIn: null }
+      : await getLongLivedToken(shortLivedToken);
     const userInfo = await getUserInfo(longLivedToken);
     // Webhooks and the messaging API key off the professional account ID
     // (user_id), not the app-scoped `id`. Store user_id so comment webhooks
@@ -67,7 +72,8 @@ export async function GET(request: NextRequest) {
     }
 
     const encryptedToken = encryptToken(longLivedToken);
-    const tokenExpiresAt = new Date(Date.now() + expiresIn * 1000);
+    const tokenExpiresAt =
+      expiresIn === null ? null : new Date(Date.now() + expiresIn * 1000);
 
     let webhookSubscribed = false;
     try {

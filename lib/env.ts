@@ -36,8 +36,25 @@ const INSTAGRAM_OAUTH_ENV = [
   "NEXTAUTH_SECRET",
 ] as const;
 
+// Meta no longer offers "API setup with Instagram login" to newly created apps;
+// they get "API setup with Unified login" instead (Facebook Login for Business
+// configuration -> system-user token on graph.facebook.com). Setting
+// META_LOGIN_CONFIG_ID switches the direct-Meta connection to that flow.
+const UNIFIED_LOGIN_OAUTH_ENV = [
+  "META_APP_ID",
+  "FACEBOOK_APP_SECRET",
+  "META_LOGIN_CONFIG_ID",
+  "ENCRYPTION_KEY",
+  "NEXTAUTH_SECRET",
+] as const;
+
+export function isUnifiedLogin(): boolean {
+  return Boolean(process.env.META_LOGIN_CONFIG_ID);
+}
+
 export function getMissingInstagramOAuthEnv(): string[] {
-  return INSTAGRAM_OAUTH_ENV.filter((name) => {
+  const required = isUnifiedLogin() ? UNIFIED_LOGIN_OAUTH_ENV : INSTAGRAM_OAUTH_ENV;
+  return required.filter((name) => {
     const value = process.env[name];
     if (!value) return true;
     // A malformed key fails later inside encryptToken, after the user has
