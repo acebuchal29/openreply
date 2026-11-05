@@ -17,7 +17,9 @@
  * (which Instagram rate-limits aggressively, error 368).
  *
  * It runs on an interval in the worker process because Vercel's free crons only
- * fire once a day. Matching and sending reuse the worker's processComment, so
+ * fire once a day, or from /api/cron/sweep when an external scheduler calls it
+ * every few minutes (no always-on worker needed). Matching and sending reuse
+ * the worker's processComment, so
  * rate limiting and logging behave exactly as for webhook-delivered comments.
  *
  * Known limitation, handled not fixed: comments removed by Instagram's Hidden
@@ -28,7 +30,7 @@
 import { MAX_COMMENT_SEND_ATTEMPTS } from "@/lib/queue/comment-delivery";
 import { hasLegacyUnconfirmedDelivery } from "@/lib/instagram/delivery-errors";
 import { prisma } from "@/lib/db/client";
-import { getDMQueue } from "@/lib/queue/client";
+import { getDMQueue, getRedisConnection } from "@/lib/queue/client";
 import {
   getRecentMediaComments,
   getUserMedia,
@@ -66,9 +68,117 @@ function errMessage(error: unknown): string {
   return "Unknown error";
 }
 
+// The sweep runs every few minutes, and on Neon's free plan every database
+// query keeps the compute awake (it only scales to zero after 5 idle minutes,
+// and the month's compute allowance runs out if it never sleeps). So the
+// campaign list is cached in Redis, and comments already known to be handled
+// are remembered there too: a sweep that finds nothing new touches only Redis
+// and Instagram, never the database. SWEEP_CACHE_SECONDS=0 turns caching off.
+const SWEEP_CACHE_SECONDS = Number(process.env.SWEEP_CACHE_SECONDS ?? 3600);
+const AUTOMATIONS_CACHE_KEY = "cache:sweep:automations:v1";
+// A little longer than the lookback, so a handled comment is never re-checked.
+const HANDLED_TTL_SECONDS = Math.ceil(LOOKBACK_HOURS * 3600) + 24 * 3600;
+
+// Redis is only an optimisation here: when it is unavailable the sweep simply
+// reads the database, as it did before caching existed.
+function cacheRedis(): ReturnType<typeof getRedisConnection> | null {
+  if (SWEEP_CACHE_SECONDS <= 0) return null;
+  try {
+    return getRedisConnection();
+  } catch {
+    return null;
+  }
+}
+
+function handledKey(automationId: string, commentId: string): string {
+  return `sweep:handled:${automationId}:${commentId}`;
+}
+
+/** Drop the cached campaign list, so the next sweep reads the database. */
+export async function invalidateSweepCache(): Promise<void> {
+  await cacheRedis()?.del(AUTOMATIONS_CACHE_KEY).catch(() => {});
+}
+
+async function cachedCommentIds(
+  automationId: string,
+  commentIds: string[]
+): Promise<Set<string>> {
+  const redis = cacheRedis();
+  if (!redis || commentIds.length === 0) return new Set();
+  try {
+    const values = await redis.mget(
+      ...commentIds.map((id) => handledKey(automationId, id))
+    );
+    return new Set(commentIds.filter((_, i) => values[i] !== null));
+  } catch {
+    return new Set();
+  }
+}
+
+async function rememberHandled(
+  automationId: string,
+  commentIds: string[]
+): Promise<void> {
+  const redis = cacheRedis();
+  if (!redis || commentIds.length === 0) return;
+  try {
+    const pipeline = redis.pipeline();
+    for (const id of commentIds) {
+      pipeline.set(handledKey(automationId, id), "1", "EX", HANDLED_TTL_SECONDS);
+    }
+    await pipeline.exec();
+  } catch {
+    // Only an optimisation: the database check still runs next time.
+  }
+}
+
+async function loadActiveAutomations() {
+  const redis = cacheRedis();
+  if (redis) {
+    try {
+      const cached = await redis.get(AUTOMATIONS_CACHE_KEY);
+      if (cached) return JSON.parse(cached) as Awaited<ReturnType<typeof queryActiveAutomations>>;
+    } catch {
+      // Fall through to the database.
+    }
+  }
+  const automations = await queryActiveAutomations();
+  if (redis) {
+    await redis
+      .set(AUTOMATIONS_CACHE_KEY, JSON.stringify(automations), "EX", SWEEP_CACHE_SECONDS)
+      .catch(() => {});
+  }
+  return automations;
+}
+
 /** One reconciliation pass across every active campaign. */
 export async function reconcileComments(): Promise<void> {
-  const automations = await prisma.automation.findMany({
+  const automations = await loadActiveAutomations();
+
+  const sinceMs = Date.now() - LOOKBACK_HOURS * 60 * 60 * 1000;
+  const tokenCache = new Map<string, InstagramContext | null>();
+
+  for (const automation of automations) {
+    const stat = await sweepCampaign({
+      automation: automation,
+      sinceMs: sinceMs,
+      tokenCache: tokenCache,
+    }).catch(
+      (error): SweepStat => ({
+        campaign: automation.name,
+        keywords: automation.keywords.join(","),
+        matched: 0,
+        alreadyReplied: 0,
+        enqueued: 0,
+        errors: [errMessage(error)],
+      })
+    );
+    await recordSweep(automation.workspaceId, stat);
+  }
+}
+
+function queryActiveAutomations() {
+  return prisma.automation.findMany({
     where: { isActive: true },
     select: {
       id: true,
@@ -93,27 +203,6 @@ export async function reconcileComments(): Promise<void> {
       },
     },
   });
-
-  const sinceMs = Date.now() - LOOKBACK_HOURS * 60 * 60 * 1000;
-  const tokenCache = new Map<string, InstagramContext | null>();
-
-  for (const automation of automations) {
-    const stat = await sweepCampaign({
-      automation: automation,
-      sinceMs: sinceMs,
-      tokenCache: tokenCache,
-    }).catch(
-      (error): SweepStat => ({
-        campaign: automation.name,
-        keywords: automation.keywords.join(","),
-        matched: 0,
-        alreadyReplied: 0,
-        enqueued: 0,
-        errors: [errMessage(error)],
-      })
-    );
-    await recordSweep(automation.workspaceId, stat);
-  }
 }
 
 async function sweepCampaign({
@@ -231,6 +320,15 @@ async function sweepCampaign({
     });
     if (needsAction.length === 0) continue;
 
+    // Comments an earlier sweep already found fully handled (remembered in
+    // Redis) need no database check at all.
+    const knownHandled = await cachedCommentIds(
+      automation.id,
+      needsAction.map((c) => c.id)
+    );
+    const toCheck = needsAction.filter((c) => !knownHandled.has(c.id));
+    if (toCheck.length === 0) continue;
+
     // Second guard against races: skip comments this campaign has already fully
     // handled. "Fully handled" depends on the campaign: if it posts a public
     // reply, the completion signal is publicReplySentAt (a DM alone is not
@@ -240,7 +338,7 @@ async function sweepCampaign({
     const logs = await prisma.dmLog.findMany({
       where: {
         automationId: automation.id,
-        commentId: { in: needsAction.map((c) => c.id) },
+        commentId: { in: toCheck.map((c) => c.id) },
       },
       select: {
         commentId: true, status: true, attempts: true, errorMessage: true,
@@ -256,9 +354,10 @@ async function sweepCampaign({
         log.publicReplySentAt || log.publicReplyDeliveryUnconfirmed;
       return dmStopped && replyStopped;
     }).map((log) => log.commentId));
+    await rememberHandled(automation.id, [...handledSet]);
 
     // Oldest first, so whoever commented earliest gets answered first, capped.
-    const fresh = needsAction
+    const fresh = toCheck
       .filter((c) => !handledSet.has(c.id))
       .sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp))
       .slice(0, MAX_NEW_PER_SWEEP);

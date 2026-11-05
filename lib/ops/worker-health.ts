@@ -11,6 +11,9 @@ export interface WorkerHeartbeat {
   hostname?: string;
   startedAt?: string;
   checkedAt: string;
+  // How long this heartbeat counts as fresh. A long-running worker beats every
+  // 30 s; a scheduled sweep (/api/cron/sweep) only beats once per run.
+  ttlSeconds?: number;
 }
 
 export interface WorkerHealth {
@@ -51,7 +54,7 @@ export async function recordWorkerHeartbeat(
     WORKER_HEALTH_KEY,
     JSON.stringify(payload),
     "EX",
-    WORKER_HEARTBEAT_TTL_SECONDS
+    payload.ttlSeconds ?? WORKER_HEARTBEAT_TTL_SECONDS
   );
 }
 
@@ -66,7 +69,8 @@ export async function getWorkerHealth(): Promise<WorkerHealth> {
 
   const ageMs = Date.now() - new Date(heartbeat.checkedAt).getTime();
   return {
-    healthy: ageMs <= WORKER_HEARTBEAT_TTL_SECONDS * 1000,
+    healthy:
+      ageMs <= (heartbeat.ttlSeconds ?? WORKER_HEARTBEAT_TTL_SECONDS) * 1000,
     heartbeat,
     ageMs,
   };
